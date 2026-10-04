@@ -1,155 +1,131 @@
-//  assign6
+/* Coursework process-control demo: bounded comma-separated commands, no shell expansion. */
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
-#include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
+
 #define MAX_COMMANDS 6
 #define BUFFER_SIZE 1024
+#define MAX_ARGS (BUFFER_SIZE / 2)
 
-
-
-void parse_commands(char *input, char *commands[]) 
+int parse_commands(char *input, char *commands[])
 {
-    int i = 0;
-
+    int count = 0;
     char *token = strtok(input, ",");
-
-    while (token != NULL && i < MAX_COMMANDS) 
-{
-        while (*token == ' ') token++; 
-        char *end = token + strlen(token) - 1;
- 
-     while (end > token && *end == ' ') *end-- = '\0';
-
-        commands[i++] = token;
+    while (token != NULL) {
+        while (isspace((unsigned char)*token)) token++;
+        char *end = token + strlen(token);
+        while (end > token && isspace((unsigned char)end[-1])) end--;
+        *end = '\0';
+        if (*token == '\0' || count == MAX_COMMANDS || strlen(token) >= BUFFER_SIZE)
+            return -1;
+        commands[count++] = token;
         token = strtok(NULL, ",");
     }
-
-
-    commands[i] = NULL;
+    commands[count] = NULL;
+    return count;
 }
 
- 
-void write_commands_to_pipe(int write_fd, char *commands[], int command_count) 
-{ 
-    for (int i = 0; i < command_count; i++) 
+int write_commands_to_pipe(int write_fd, char *commands[], int command_count)
 {
-        if (write(write_fd, commands[i], BUFFER_SIZE) == -1)  
-{
-            fprintf(stderr, "Error writing to pipe: %s\n", strerror(errno));
-            exit(EXIT_FAILURE);
- 
-
+    for (int i = 0; i < command_count; i++) {
+        const char *cursor = commands[i];
+        size_t remaining = strlen(cursor) + 1;
+        while (remaining > 0) {
+            ssize_t written = write(write_fd, cursor, remaining);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                perror("Error writing command");
+                close(write_fd);
+                return -1;
+            }
+            cursor += written;
+            remaining -= (size_t)written;
         }
     }
-
-
     close(write_fd);
-
+    return 0;
 }
 
-
-
-void read_and_execute_command_from_pipe(int read_fd) 
+void read_and_execute_command_from_pipe(int read_fd)
 {
     char command[BUFFER_SIZE];
-    if (read(read_fd, command, BUFFER_SIZE) > 0) 
-{
-        char *args[MAX_COMMANDS];
-        int i = 0;
-
-
-        args[i] = strtok(command, " ");
-
-        while (args[i] != NULL) {
-            args[++i] = strtok(NULL, " ");
-
+    size_t used = 0;
+    while (used < sizeof(command)) {
+        ssize_t received = read(read_fd, command + used, sizeof(command) - used);
+        if (received < 0) {
+            if (errno == EINTR) continue;
+            perror("Error reading command");
+            close(read_fd);
+            _exit(EXIT_FAILURE);
         }
-
-        // printing all
-        fprintf(stderr, "PID: %d, PPID: %d, CMD: %s\n", getpid(), getppid(), args[0]);
-        execvp(args[0], args);
-
-        fprintf(stderr, "Error executing command '%s': %s\n", args[0], strerror(errno));
-        exit(EXIT_FAILURE);
+        if (received == 0) break;
+        used += (size_t)received;
     }
+    close(read_fd);
+    if (used == 0 || memchr(command, '\0', used) == NULL) _exit(EXIT_FAILURE);
 
-    exit(EXIT_SUCCESS);
+    char *args[MAX_ARGS + 1];
+    size_t count = 0;
+    char *token = strtok(command, " \t\r\n");
+    while (token != NULL && count < MAX_ARGS) {
+        args[count++] = token;
+        token = strtok(NULL, " \t\r\n");
+    }
+    if (count == 0 || token != NULL) _exit(EXIT_FAILURE);
+    args[count] = NULL;
+    execvp(args[0], args);
+    perror("Error executing command");
+    _exit(EXIT_FAILURE);
 }
 
-
-
-int main(int argc, char *argv[]) 
+int main(int argc, char *argv[])
 {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s \"command1 , command2 , ...\"\n", argv[0]); 
-
-
+        fprintf(stderr, "Usage: %s \"command1, command2, ...\"\n", argv[0]);
         return EXIT_FAILURE;
     }
-	
-    char *commands[MAX_COMMANDS + 1] = {NULL};
-    parse_commands(argv[1], commands);
-
-  	  int command_count = 0;
-   	  for (int i = 0; commands[i] != NULL; i++) 
-{
-        command_count++;
-    }
-
-    int pipe_fd[2];
-    if (pipe(pipe_fd) == -1) 
-{	//error
-        fprintf(stderr, "Error creating pipe: %s\n", strerror(errno));
+    char *commands[MAX_COMMANDS + 1];
+    int command_count = parse_commands(argv[1], commands);
+    if (command_count <= 0) {
+        fprintf(stderr, "Provide 1-6 nonempty commands, each shorter than 1024 bytes.\n");
         return EXIT_FAILURE;
     }
 
-    // commands go to pipe
-
-    if (fork() == 0) {
-        // child wriitng
-        close(pipe_fd[0]); 
-
-        write_commands_to_pipe(pipe_fd[1], commands, command_count); 
-    exit(EXIT_SUCCESS);
-    }
- else 
-{
-        close(pipe_fd[1]); 
-        wait(NULL);
-    }
-
-
- 
-    pid_t pids[MAX_COMMANDS]; 
-
-    // forks
-
-    for (int i = 0; i < command_count; i++) 
-{
+    pid_t pids[MAX_COMMANDS];
+    int launched = 0, failed = 0;
+    for (int i = 0; i < command_count; i++) {
+        int pipe_fd[2];
+        if (pipe(pipe_fd) != 0) {
+            perror("Error creating pipe");
+            failed = 1;
+            break;
+        }
         pid_t pid = fork();
         if (pid < 0) {
-            fprintf(stderr, "Fork failed: %s\n", strerror(errno)); 
-            return EXIT_FAILURE;
+            perror("Fork failed");
+            close(pipe_fd[0]); close(pipe_fd[1]);
+            failed = 1;
+            break;
         }
- else if (pid == 0) {
-  
+        if (pid == 0) {
+            close(pipe_fd[1]);
             read_and_execute_command_from_pipe(pipe_fd[0]);
-        } else 
-{
-            pids[i] = pid; 
         }
+        close(pipe_fd[0]);
+        pids[launched++] = pid;
+        /* Each child owns one pipe, so partial reads cannot split another command. */
+        if (write_commands_to_pipe(pipe_fd[1], &commands[i], 1) != 0) failed = 1;
     }
-    close(pipe_fd[0]);
-
-    for (int i = 0; i < command_count; i++) 
-{
-        waitpid(pids[i], NULL, 0); 
+    for (int i = 0; i < launched; i++) {
+        int status;
+        pid_t result;
+        do { result = waitpid(pids[i], &status, 0); } while (result < 0 && errno == EINTR);
+        if (result < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = 1;
     }
-
-
-    return EXIT_SUCCESS;
+    return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
