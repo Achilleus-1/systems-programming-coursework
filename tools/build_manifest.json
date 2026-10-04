@@ -1,0 +1,18 @@
+[
+  {
+    "compiler": "gcc",
+    "sources": [
+      "binary-course-records/assign5.c"
+    ]
+  },
+  {
+    "compiler": "gcc",
+    "sources": [
+      "process-control/assign6.c"
+    ],
+    "platforms": [
+      "linux",
+      "darwin"
+    ]
+  }
+]
